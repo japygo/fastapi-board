@@ -14,6 +14,8 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.domain.user import User
+from app.auth.dependencies import get_current_active_user
 from app.services.post_service import PostService
 from app.schemas.post import (
     PostCreateRequest,
@@ -78,8 +80,11 @@ def get_post(
     summary="게시글 생성",
 )
 def create_post(
-    request: PostCreateRequest,   # 요청 본문 (Spring의 @RequestBody @Valid PostCreateRequest)
+    request: PostCreateRequest,
     db: Session = Depends(get_db),
+    # 인증 적용: 이 파라미터가 있으면 JWT 토큰이 없을 때 401 자동 반환
+    # Spring의 @PreAuthorize("isAuthenticated()") 와 동일한 효과
+    current_user: User = Depends(get_current_active_user),
 ):
     """
     새 게시글을 생성합니다.
@@ -101,6 +106,7 @@ def update_post(
     post_id: int,
     request: PostUpdateRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),  # 인증 필요
 ):
     """
     게시글을 수정합니다. 입력한 필드만 변경됩니다 (PATCH 방식).
@@ -120,6 +126,7 @@ def update_post(
 def delete_post(
     post_id: int,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),  # 인증 필요
 ):
     """게시글을 삭제합니다. 연관된 댓글도 함께 삭제됩니다."""
     post_service.delete_post(db, post_id)

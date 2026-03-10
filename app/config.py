@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     debug: bool = False
 
+    # ── JWT 설정 (Spring Security의 JwtProperties 역할) ──────────────────────
+    # secret_key: JWT 서명에 사용하는 비밀 키
+    # Spring의 @Value("${jwt.secret}") 와 동일한 방식으로 .env 에서 읽습니다
+    secret_key: str = "changeme-use-openssl-rand-hex-32-in-production"
+    # 서명 알고리즘 (HS256 = HMAC-SHA256, Spring의 SignatureAlgorithm.HS256)
+    algorithm: str = "HS256"
+    # 액세스 토큰 만료 시간(분) (Spring의 jwt.expiration 설정)
+    access_token_expire_minutes: int = 30
+
     # 데이터베이스 연결 URL
     # SQLite:      sqlite:///./board.db          (파일 기반)
     # SQLite 메모리: sqlite:///:memory:           (테스트용, 프로세스 종료 시 사라짐)

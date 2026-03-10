@@ -5,10 +5,10 @@
 from fastapi import FastAPI
 
 from app.config import settings
-from app.routers import post_router, comment_router
+from app.routers import post_router, comment_router, auth_router
 
 # 도메인 모델 임포트 (SQLAlchemy 레지스트리에 등록)
-from app.domain import post, comment  # noqa: F401
+from app.domain import post, comment, user  # noqa: F401
 
 # ── 테이블 관리 방식 변경 안내 ─────────────────────────────────────────────────
 # [Before] Base.metadata.create_all(bind=engine)
@@ -40,6 +40,7 @@ app = FastAPI(
 # ── 라우터 등록 ────────────────────────────────────────────────────────────────
 # Spring의 @RestController 를 @SpringBootApplication 이 자동으로 스캔하는 것과 달리,
 # FastAPI는 명시적으로 include_router() 로 등록해야 합니다
+app.include_router(auth_router.router)     # 인증 API (회원가입/로그인)
 app.include_router(post_router.router)     # 게시글 API
 app.include_router(comment_router.router)  # 댓글 API
 

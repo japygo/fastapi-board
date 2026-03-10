@@ -5,9 +5,13 @@ description = "FastAPI + SQLAlchemy 학습용 게시판 프로젝트"
 requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.18.4",
+    "bcrypt>=4.0,<5.0",
     "fastapi>=0.135.1",
+    "passlib[bcrypt]>=1.7.4",
     "pydantic-settings>=2.13.1",
     "python-dotenv>=1.2.2",
+    "python-jose[cryptography]>=3.5.0",
+    "python-multipart>=0.0.22",
     "sqlalchemy>=2.0.48",
     "uvicorn[standard]>=0.41.0",
 ]
