@@ -44,6 +44,19 @@ class Post(Base):
     # @Column(nullable = false, length = 50)
     author: Mapped[str] = mapped_column(String(50), nullable=False, comment="작성자")
 
+    # 조회수 (기본값 0)
+    # [Alembic 두 번째 마이그레이션 학습용]
+    # 이 컬럼은 나중에 추가됩니다. 모델에 추가한 뒤:
+    #   $ uv run alembic revision --autogenerate -m "add_view_count"
+    #   $ uv run alembic upgrade head
+    # Flyway 비교: V2__add_view_count_to_posts.sql 에 ALTER TABLE 작성하는 것과 동일
+    view_count: Mapped[int] = mapped_column(
+        default=0,
+        server_default="0",
+        nullable=False,
+        comment="조회수",
+    )
+
     # @CreatedDate (Spring Data JPA의 Auditing)
     # server_default=func.now(): DB 서버에서 현재 시간을 기본값으로 설정
     # INSERT 시 자동으로 현재 시간이 저장됩니다

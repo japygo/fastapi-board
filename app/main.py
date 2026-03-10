@@ -5,17 +5,22 @@
 from fastapi import FastAPI
 
 from app.config import settings
-from app.database import Base, engine
 from app.routers import post_router, comment_router
 
-# 도메인 모델 임포트 (테이블 생성을 위해 SQLAlchemy에 등록)
+# 도메인 모델 임포트 (SQLAlchemy 레지스트리에 등록)
 from app.domain import post, comment  # noqa: F401
 
-# ── 데이터베이스 테이블 자동 생성 ──────────────────────────────────────────────
-# Spring Boot의 spring.jpa.hibernate.ddl-auto=create-drop 과 유사
-# 개발 환경에서는 편리하지만, 운영 환경에서는 Alembic 마이그레이션을 사용합니다
-# (나중에 Alembic 커밋에서 이 부분을 대체합니다)
-Base.metadata.create_all(bind=engine)
+# ── 테이블 관리 방식 변경 안내 ─────────────────────────────────────────────────
+# [Before] Base.metadata.create_all(bind=engine)
+#   → Spring의 ddl-auto=create 와 같이 앱 시작 시 테이블을 자동 생성
+#   → 개발 편의용이지만, 컬럼 추가/삭제 등 변경사항을 추적하지 못함
+#
+# [After] Alembic이 테이블 생성 및 변경 관리
+#   → Spring의 Flyway/Liquibase 와 동일한 방식
+#   → 서버 실행 전에 반드시 마이그레이션 적용 필요:
+#      $ uv run alembic upgrade head
+#   → 테이블 변경 시 새 마이그레이션 파일 생성:
+#      $ uv run alembic revision --autogenerate -m "변경_내용"
 
 # ── FastAPI 애플리케이션 인스턴스 생성 ────────────────────────────────────────
 # Spring Boot의 SpringApplication.run() 과 유사한 역할
