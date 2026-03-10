@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 환경 변수 파일 (비밀 정보 포함 - Spring의 application-secret.properties 역할)
+.env
+# .env.test 는 테스트용이므로 공유 가능
+
+# SQLite 데이터베이스 파일 (로컬 개발용)
+*.db
+*.sqlite
+
+# pytest 캐시
+.pytest_cache/
+
+# IDE 설정
+.idea/
+.vscode/
