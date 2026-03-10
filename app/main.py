@@ -5,8 +5,19 @@
 from fastapi import FastAPI
 
 from app.config import settings
+from app.database import Base, engine
+from app.routers import post_router, comment_router
 
-# FastAPI 애플리케이션 인스턴스 생성
+# 도메인 모델 임포트 (테이블 생성을 위해 SQLAlchemy에 등록)
+from app.domain import post, comment  # noqa: F401
+
+# ── 데이터베이스 테이블 자동 생성 ──────────────────────────────────────────────
+# Spring Boot의 spring.jpa.hibernate.ddl-auto=create-drop 과 유사
+# 개발 환경에서는 편리하지만, 운영 환경에서는 Alembic 마이그레이션을 사용합니다
+# (나중에 Alembic 커밋에서 이 부분을 대체합니다)
+Base.metadata.create_all(bind=engine)
+
+# ── FastAPI 애플리케이션 인스턴스 생성 ────────────────────────────────────────
 # Spring Boot의 SpringApplication.run() 과 유사한 역할
 app = FastAPI(
     title=settings.app_name,
@@ -20,6 +31,12 @@ app = FastAPI(
     - 댓글 CRUD
     """,
 )
+
+# ── 라우터 등록 ────────────────────────────────────────────────────────────────
+# Spring의 @RestController 를 @SpringBootApplication 이 자동으로 스캔하는 것과 달리,
+# FastAPI는 명시적으로 include_router() 로 등록해야 합니다
+app.include_router(post_router.router)     # 게시글 API
+app.include_router(comment_router.router)  # 댓글 API
 
 
 # ── 헬스체크 엔드포인트 ─────────────────────────────────────────────────────────
