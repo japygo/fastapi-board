@@ -13,6 +13,11 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 
+# 모든 도메인 모델을 임포트하여 SQLAlchemy 레지스트리에 등록
+# Post가 relationship("Comment")를 참조하므로, Comment도 반드시 임포트 필요
+# Spring에서 @Entity 클래스들이 컨텍스트 로딩 시 자동 스캔되는 것과 유사한 역할
+from app.domain import post, comment  # noqa: F401 (사용하지 않아도 등록 목적으로 임포트)
+
 # ── 테스트용 인메모리 DB 설정 ──────────────────────────────────────────────────
 # Spring의 @DataJpaTest 가 H2 인메모리 DB를 자동으로 사용하는 것과 동일한 개념
 # 각 테스트 세션마다 깨끗한 인메모리 DB를 사용합니다
