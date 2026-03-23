@@ -10,13 +10,14 @@
 #     ...
 # }
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, BackgroundTasks, Depends, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.domain.user import User
 from app.auth.dependencies import get_current_active_user
 from app.services.post_service import PostService
+from app.tasks import increment_view_count
 from app.schemas.post import (
     PostCreateRequest,
     PostUpdateRequest,
@@ -66,10 +67,36 @@ def get_posts(
 )
 def get_post(
     post_id: int,           # FastAPI가 URL에서 자동으로 int로 변환
+    background_tasks: BackgroundTasks,  # Spring의 @Async 호출을 위한 트리거 역할
     db: Session = Depends(get_db),
 ):
-    """ID로 게시글을 조회합니다. 존재하지 않으면 404를 반환합니다."""
-    return post_service.get_post(db, post_id)
+    """
+    ID로 게시글을 조회합니다. 존재하지 않으면 404를 반환합니다.
+
+    [BackgroundTasks 동작 순서]
+    1. 게시글 조회 → 클라이언트에 응답 반환 (빠른 응답)
+    2. 응답 반환 완료 후 → 백그라운드에서 view_count += 1 실행
+
+    Spring @Async 비교:
+        @GetMapping("/{id}")
+        public PostResponse getPost(@PathVariable Long id) {
+            PostResponse response = postService.getPost(id);
+            asyncTaskService.incrementViewCount(id);  // @Async 메서드 호출
+            return response;                          // 즉시 반환, @Async는 별도 실행
+        }
+
+    차이점:
+    - Spring @Async: 메서드 호출 즉시 별도 스레드에서 실행 시작
+    - FastAPI BackgroundTasks: 응답이 클라이언트에 완전히 전송된 뒤 실행 시작
+    """
+    post = post_service.get_post(db, post_id)
+
+    # 응답 반환 후 백그라운드에서 조회수 증가
+    # add_task(함수, *인자) 형태로 등록
+    # Spring의 asyncTaskService.incrementViewCount(post_id) 와 동일한 역할
+    background_tasks.add_task(increment_view_count, post_id)
+
+    return post
 
 
 # ── 게시글 생성 ────────────────────────────────────────────────────────────────

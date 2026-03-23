@@ -59,6 +59,16 @@ def override_get_db():
 # 앱 레벨에서 의존성 오버라이드 등록 (한 번만 실행)
 app.dependency_overrides[get_db] = override_get_db
 
+# ── BackgroundTask 세션 오버라이드 ──────────────────────────────────────────────
+# tasks.py의 increment_view_count 는 SessionLocal() 을 직접 호출합니다.
+# 테스트 시 실제 DB가 아닌 테스트 DB를 사용하도록 오버라이드합니다.
+#
+# Spring 비교:
+# @MockBean AsyncTaskService 로 @Async 메서드를 목(Mock) 처리하거나,
+# @TestConfiguration 으로 다른 DataSource 를 주입하는 것과 동일한 역할
+import app.tasks as tasks_module
+tasks_module.SessionLocal = TestSessionLocal  # type: ignore[assignment]
+
 
 # ── 단위 테스트용 DB 세션 픽스처 ───────────────────────────────────────────────
 @pytest.fixture(scope="function")

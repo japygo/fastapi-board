@@ -103,6 +103,7 @@ class PostResponse(PostBase):
     """
 
     id: int = Field(description="게시글 ID")
+    view_count: int = Field(default=0, description="조회수")
     created_at: datetime = Field(description="작성일시")
     updated_at: datetime = Field(description="수정일시")
 

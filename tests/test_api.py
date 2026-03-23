@@ -9,6 +9,8 @@
 # conftest.py의 `client` 픽스처를 통해 각 테스트마다 인메모리 DB를 사용합니다.
 # DB 설정 중복 코드가 여기에 없는 이유도 conftest.py로 통합했기 때문입니다.
 
+import time
+
 
 def get_auth_header(client) -> dict:
     """
@@ -115,6 +117,108 @@ class TestPostAPI:
 
         get_response = client.get(f"/api/posts/{created['id']}")
         assert get_response.status_code == 404
+
+
+class TestBackgroundTasks:
+    """
+    BackgroundTasks 테스트
+
+    [Spring @Async 테스트 비교]
+    Spring에서는 @Async 메서드를 테스트하려면:
+    1. @MockBean 으로 @Async 서비스를 목(Mock) 처리
+    2. CompletableFuture.get() 으로 완료를 기다림
+    3. 또는 CountDownLatch 로 비동기 실행 대기
+
+    FastAPI TestClient 는 BackgroundTasks 를 응답 반환 즉시 동기적으로 실행합니다.
+    따라서 응답 받은 직후 DB를 조회하면 이미 반영된 상태입니다.
+    (별도로 await 하거나 sleep 할 필요 없음)
+    """
+
+    def _create_post(self, client) -> dict:
+        """게시글 생성 헬퍼"""
+        headers = get_auth_header(client)
+        resp = client.post(
+            "/api/posts/",
+            json={"title": "테스트", "content": "내용", "author": "작성자"},
+            headers=headers,
+        )
+        assert resp.status_code == 201
+        return resp.json()
+
+    def test_게시글_조회_시_조회수_증가(self, client):
+        """
+        GET /api/posts/{id} 호출 후 view_count 가 1 증가하는지 검증
+
+        [핵심 동작 순서 - BackgroundTask vs @Async 차이]
+
+        BackgroundTask:
+            요청 A: [조회(view=0) → 응답반환(view=0)] → [백그라운드: view=1로 업데이트]
+            요청 B: [조회(view=1) → 응답반환(view=1)] → [백그라운드: view=2로 업데이트]
+            ↑ 응답 본문에는 "업데이트 이전" 값이 담깁니다.
+            ↑ 다음 요청에서 업데이트된 값을 볼 수 있습니다.
+
+        Spring @Async:
+            요청 A: [조회(view=0) → @Async 호출 → 응답반환(view=0)]
+            @Async: 별도 스레드에서 view=1로 업데이트
+            ↑ 마찬가지로 응답 본문에는 "업데이트 이전" 값이 담깁니다.
+
+        TestClient 특이사항:
+        - 실제 서버와 달리 BackgroundTask를 응답 직후 동기적으로 실행합니다.
+        - 따라서 다음 요청에서 이미 업데이트된 view_count 를 읽을 수 있습니다.
+        - Spring @Async 테스트에서 Thread.sleep() 이 필요 없는 것과 유사합니다.
+        """
+        post = self._create_post(client)
+        post_id = post["id"]
+
+        # view_count 초기값 확인
+        assert post["view_count"] == 0
+
+        # 1번째 조회: 응답에는 view_count=0 (BackgroundTask가 아직 반영 전)
+        first_response = client.get(f"/api/posts/{post_id}").json()
+        assert first_response["view_count"] == 0
+        # → TestClient가 BackgroundTask 실행 완료: DB에 view_count=1 저장됨
+
+        # 2번째 조회: 1번째 BackgroundTask가 반영된 값(1)을 읽음
+        second_response = client.get(f"/api/posts/{post_id}").json()
+        assert second_response["view_count"] == 1
+        # → TestClient가 BackgroundTask 실행 완료: DB에 view_count=2 저장됨
+
+    def test_여러_번_조회_시_조회수_누적(self, client):
+        """
+        게시글을 N번 조회하면 view_count 가 N만큼 증가
+
+        [패턴]
+        조회 응답에 담기는 view_count 는 항상 "이전 BackgroundTask까지의 결과" 입니다.
+        - 1번째 조회 응답: 0 (초기값)
+        - 2번째 조회 응답: 1 (1번째 BackgroundTask 결과)
+        - 3번째 조회 응답: 2 (2번째 BackgroundTask 결과)
+        - ...
+        """
+        post = self._create_post(client)
+        post_id = post["id"]
+
+        조회_횟수 = 5
+        for i in range(조회_횟수):
+            response = client.get(f"/api/posts/{post_id}").json()
+            # i번째 조회 응답에는 (i)번째 BackgroundTask 결과가 담김
+            assert response["view_count"] == i
+
+        # 마지막 조회(6번째)에서 최종 누적값 확인
+        final = client.get(f"/api/posts/{post_id}").json()
+        assert final["view_count"] == 조회_횟수
+
+    def test_존재하지_않는_게시글_조회수_증가_오류_없음(self, client):
+        """
+        없는 게시글 조회 시 404 반환, 백그라운드 태스크 오류도 클라이언트에 전파 안됨
+
+        [핵심]
+        BackgroundTask 내부에서 예외가 발생해도 HTTP 응답에는 영향 없음.
+        Spring @Async 에서 예외가 CompletableFuture 에 담기지만
+        호출자에게 전파되지 않는 것과 동일한 원리.
+        """
+        # 없는 게시글 → 404 반환 (태스크 등록 전에 서비스에서 예외 발생)
+        response = client.get("/api/posts/99999")
+        assert response.status_code == 404
 
 
 class TestCommentAPI:
