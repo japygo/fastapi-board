@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     # PostgreSQL:  postgresql://user:pass@host:5432/dbname
     database_url: str = "sqlite:///./board.db"
 
+    # ── Redis 설정 (Spring의 spring.data.redis.* 역할) ───────────────────────
+    # spring.data.redis.host=localhost
+    # spring.data.redis.port=6379
+    # spring.data.redis.database=0
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 0
+
     # SettingsConfigDict: 설정 메타데이터 (Spring의 @PropertySource 역할)
     model_config = SettingsConfigDict(
         # 읽을 .env 파일 경로 (여러 파일 지정 가능, 뒤에 오는 파일이 우선순위 높음)
