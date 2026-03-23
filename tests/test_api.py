@@ -11,6 +11,8 @@
 
 import time
 
+from tests.conftest import fake_redis
+
 
 def get_auth_header(client) -> dict:
     """
@@ -147,63 +149,63 @@ class TestBackgroundTasks:
 
     def test_게시글_조회_시_조회수_증가(self, client):
         """
-        GET /api/posts/{id} 호출 후 view_count 가 1 증가하는지 검증
+        GET /api/posts/{id} 호출 후 view_count 가 DB에 1 증가하는지 검증
 
-        [핵심 동작 순서 - BackgroundTask vs @Async 차이]
+        [캐시 + BackgroundTask 함께 쓸 때의 트레이드오프]
 
-        BackgroundTask:
-            요청 A: [조회(view=0) → 응답반환(view=0)] → [백그라운드: view=1로 업데이트]
-            요청 B: [조회(view=1) → 응답반환(view=1)] → [백그라운드: view=2로 업데이트]
-            ↑ 응답 본문에는 "업데이트 이전" 값이 담깁니다.
-            ↑ 다음 요청에서 업데이트된 값을 볼 수 있습니다.
+        캐시가 없을 때:
+            요청 A: [DB조회(view=0) → 응답(view=0)] → [백그라운드: DB view=1]
+            요청 B: [DB조회(view=1) → 응답(view=1)] → [백그라운드: DB view=2]
 
-        Spring @Async:
-            요청 A: [조회(view=0) → @Async 호출 → 응답반환(view=0)]
-            @Async: 별도 스레드에서 view=1로 업데이트
-            ↑ 마찬가지로 응답 본문에는 "업데이트 이전" 값이 담깁니다.
+        캐시가 있을 때 (현재 상태):
+            요청 A: [캐시MISS→DB조회(view=0) → 응답(view=0) → 캐시저장] → [백그라운드: DB view=1]
+            요청 B: [캐시HIT → 응답(view=0, 스테일!)]  ← DB는 1이지만 캐시는 0
+            → 캐시 TTL이 만료되기 전까지 view_count 는 응답에서 변화가 없음
 
-        TestClient 특이사항:
-        - 실제 서버와 달리 BackgroundTask를 응답 직후 동기적으로 실행합니다.
-        - 따라서 다음 요청에서 이미 업데이트된 view_count 를 읽을 수 있습니다.
-        - Spring @Async 테스트에서 Thread.sleep() 이 필요 없는 것과 유사합니다.
+        [실무 해결책]
+        1. BackgroundTask에서 DB 업데이트 후 캐시도 함께 무효화
+        2. view_count 전용 별도 캐시(TTL 짧게) 사용
+        3. 응답에는 stale view_count 허용 (대형 서비스의 일반적인 전략)
+
+        [이 테스트의 접근]
+        캐시를 초기화하며 DB의 실제 view_count 변화를 검증합니다.
+        (실제 서비스에서는 캐시 TTL 만료 후 최신값이 반영됩니다)
         """
         post = self._create_post(client)
         post_id = post["id"]
+        cache_key = f"post:{post_id}"
 
-        # view_count 초기값 확인
-        assert post["view_count"] == 0
-
-        # 1번째 조회: 응답에는 view_count=0 (BackgroundTask가 아직 반영 전)
+        # 1번째 조회: 캐시 MISS → DB 조회(view=0) → 응답 → 백그라운드: DB view=1
         first_response = client.get(f"/api/posts/{post_id}").json()
         assert first_response["view_count"] == 0
-        # → TestClient가 BackgroundTask 실행 완료: DB에 view_count=1 저장됨
 
-        # 2번째 조회: 1번째 BackgroundTask가 반영된 값(1)을 읽음
+        # 캐시 무효화 후 다시 조회 → DB에서 최신값(1) 읽음
+        fake_redis.delete(cache_key)
         second_response = client.get(f"/api/posts/{post_id}").json()
         assert second_response["view_count"] == 1
-        # → TestClient가 BackgroundTask 실행 완료: DB에 view_count=2 저장됨
+        # → DB에는 view_count=2 저장됨 (백그라운드 태스크 실행됨)
 
     def test_여러_번_조회_시_조회수_누적(self, client):
         """
-        게시글을 N번 조회하면 view_count 가 N만큼 증가
+        게시글을 N번 조회하면 view_count 가 DB에 N만큼 누적되는지 검증
 
-        [패턴]
-        조회 응답에 담기는 view_count 는 항상 "이전 BackgroundTask까지의 결과" 입니다.
-        - 1번째 조회 응답: 0 (초기값)
-        - 2번째 조회 응답: 1 (1번째 BackgroundTask 결과)
-        - 3번째 조회 응답: 2 (2번째 BackgroundTask 결과)
-        - ...
+        캐시를 매번 무효화하여 DB의 실제 누적값을 확인합니다.
+        (실제 운영에서는 캐시 TTL 만료 후 최신 view_count 가 반영됩니다)
         """
         post = self._create_post(client)
         post_id = post["id"]
+        cache_key = f"post:{post_id}"
 
         조회_횟수 = 5
         for i in range(조회_횟수):
+            # 캐시 무효화 → 항상 DB에서 최신값을 읽음
+            fake_redis.delete(cache_key)
             response = client.get(f"/api/posts/{post_id}").json()
-            # i번째 조회 응답에는 (i)번째 BackgroundTask 결과가 담김
+            # 매 조회 시 이전 백그라운드 태스크 결과가 DB에 반영되어 있음
             assert response["view_count"] == i
 
-        # 마지막 조회(6번째)에서 최종 누적값 확인
+        # 최종 DB 확인
+        fake_redis.delete(cache_key)
         final = client.get(f"/api/posts/{post_id}").json()
         assert final["view_count"] == 조회_횟수
 
@@ -283,3 +285,147 @@ class TestCommentAPI:
 
         list_response = client.get(f"/api/posts/{post['id']}/comments/")
         assert len(list_response.json()) == 0
+
+
+class TestRedisCache:
+    """
+    Redis 캐싱 테스트
+
+    [Spring @Cacheable / @CacheEvict 테스트 비교]
+    Spring에서는 @SpringBootTest + EmbeddedRedis 또는 @MockBean CacheManager 로 테스트합니다.
+    여기서는 conftest.py에서 fakeredis 로 교체했으므로 실제 Redis 없이 테스트합니다.
+    """
+
+    def _create_post(self, client) -> dict:
+        headers = get_auth_header(client)
+        resp = client.post(
+            "/api/posts/",
+            json={"title": "캐시 테스트", "content": "내용", "author": "작성자"},
+            headers=headers,
+        )
+        assert resp.status_code == 201
+        return resp.json()
+
+    def test_게시글_단건_조회_캐시_히트(self, client):
+        """
+        같은 게시글을 두 번 조회하면 두 번째는 Redis 캐시에서 반환되는지 검증
+
+        [검증 방법]
+        fakeredis 에서 캐시 키 존재 여부를 직접 확인합니다.
+        Spring 테스트에서 verify(cacheManager).getCache("post") 하는 것과 유사합니다.
+
+        Spring @Cacheable 비교:
+            @Test
+            void 캐시_히트_테스트() {
+                // 첫 번째 호출: DB 조회 후 캐시 저장
+                postService.getPost(1L);
+                // 두 번째 호출: 캐시에서 반환 (DB 조회 없음)
+                postService.getPost(1L);
+                // Mockito로 repository 호출 횟수 검증
+                verify(postRepository, times(1)).findById(1L);
+            }
+        """
+        post = self._create_post(client)
+        post_id = post["id"]
+
+        # 첫 번째 조회: 캐시 MISS → DB 조회 후 캐시 저장
+        resp1 = client.get(f"/api/posts/{post_id}")
+        assert resp1.status_code == 200
+
+        # fakeredis 에서 캐시 키 확인
+        cache_key = f"post:{post_id}"
+        assert fake_redis.exists(cache_key), f"캐시 키 '{cache_key}' 가 존재해야 합니다"
+
+        # 두 번째 조회: 캐시 HIT → Redis에서 반환
+        resp2 = client.get(f"/api/posts/{post_id}")
+        assert resp2.status_code == 200
+        assert resp1.json()["title"] == resp2.json()["title"]
+
+    def test_게시글_목록_조회_캐시_저장(self, client):
+        """
+        게시글 목록 조회 후 캐시가 저장되는지 검증
+
+        Spring @Cacheable 비교:
+            @Cacheable(value = "posts", key = "'posts:0:20'")
+            public PostListResponse getPosts(int skip, int limit) { ... }
+        """
+        self._create_post(client)
+
+        # 목록 조회
+        client.get("/api/posts/?skip=0&limit=20")
+
+        # 목록 캐시 키 확인
+        assert fake_redis.exists("posts:0:20"), "목록 캐시 키 'posts:0:20' 가 존재해야 합니다"
+
+    def test_게시글_생성_시_목록_캐시_무효화(self, client):
+        """
+        게시글 생성 후 목록 캐시가 삭제되는지 검증 (@CacheEvict 동작)
+
+        Spring @CacheEvict 비교:
+            @CacheEvict(value = "posts", allEntries = true)
+            public PostResponse createPost(PostCreateRequest request) { ... }
+        """
+        headers = get_auth_header(client)
+
+        # 1. 목록 캐시 생성
+        client.get("/api/posts/?skip=0&limit=20")
+        assert fake_redis.exists("posts:0:20"), "목록 캐시가 있어야 합니다"
+
+        # 2. 게시글 생성 → @CacheEvict 동작
+        client.post(
+            "/api/posts/",
+            json={"title": "새 게시글", "content": "내용", "author": "작성자"},
+            headers=headers,
+        )
+
+        # 3. 목록 캐시가 삭제됐는지 확인
+        assert not fake_redis.exists("posts:0:20"), "생성 후 목록 캐시가 삭제돼야 합니다"
+
+    def test_게시글_수정_시_단건_및_목록_캐시_무효화(self, client):
+        """
+        게시글 수정 후 단건 캐시 + 목록 캐시 모두 삭제되는지 검증
+
+        Spring @Caching 비교:
+            @Caching(evict = {
+                @CacheEvict(value = "post", key = "#id"),
+                @CacheEvict(value = "posts", allEntries = true)
+            })
+            public PostResponse updatePost(Long id, PostUpdateRequest request) { ... }
+        """
+        headers = get_auth_header(client)
+        post = self._create_post(client)
+        post_id = post["id"]
+
+        # 1. 단건 + 목록 캐시 생성
+        client.get(f"/api/posts/{post_id}")
+        client.get("/api/posts/?skip=0&limit=20")
+        assert fake_redis.exists(f"post:{post_id}")
+        assert fake_redis.exists("posts:0:20")
+
+        # 2. 게시글 수정 → 캐시 무효화
+        client.patch(
+            f"/api/posts/{post_id}",
+            json={"title": "수정된 제목"},
+            headers=headers,
+        )
+
+        # 3. 단건 + 목록 캐시 모두 삭제됐는지 확인
+        assert not fake_redis.exists(f"post:{post_id}"), "수정 후 단건 캐시가 삭제돼야 합니다"
+        assert not fake_redis.exists("posts:0:20"), "수정 후 목록 캐시가 삭제돼야 합니다"
+
+    def test_게시글_삭제_시_캐시_무효화(self, client):
+        """게시글 삭제 후 단건 캐시 + 목록 캐시 모두 삭제"""
+        headers = get_auth_header(client)
+        post = self._create_post(client)
+        post_id = post["id"]
+
+        # 캐시 생성
+        client.get(f"/api/posts/{post_id}")
+        client.get("/api/posts/?skip=0&limit=20")
+
+        # 삭제
+        client.delete(f"/api/posts/{post_id}", headers=headers)
+
+        # 캐시 무효화 확인
+        assert not fake_redis.exists(f"post:{post_id}")
+        assert not fake_redis.exists("posts:0:20")

@@ -69,6 +69,21 @@ app.dependency_overrides[get_db] = override_get_db
 import app.tasks as tasks_module
 tasks_module.SessionLocal = TestSessionLocal  # type: ignore[assignment]
 
+# ── Redis(캐시) 오버라이드 ──────────────────────────────────────────────────────
+# 테스트 시 실제 Redis 서버 없이 fakeredis(인메모리 Redis 구현체)를 사용합니다.
+# app.cache.redis_client 를 fakeredis 인스턴스로 교체합니다.
+#
+# Spring 비교:
+# @MockBean RedisTemplate 으로 Redis를 목(Mock) 처리하거나,
+# @TestConfiguration 에서 EmbeddedRedis 를 사용하는 것과 동일한 역할
+import fakeredis
+import app.cache as cache_module
+
+# fakeredis: 실제 Redis와 동일한 인터페이스를 메모리에서 구현
+# decode_responses=True: bytes 대신 str 반환 (실제 redis_client 설정과 동일)
+fake_redis = fakeredis.FakeRedis(decode_responses=True)
+cache_module.redis_client = fake_redis  # type: ignore[assignment]
+
 
 # ── 단위 테스트용 DB 세션 픽스처 ───────────────────────────────────────────────
 @pytest.fixture(scope="function")
@@ -97,10 +112,17 @@ def client():
     """
     API 통합 테스트용 TestClient 픽스처
 
-    각 테스트마다 테이블을 초기화하여 테스트 격리를 보장합니다.
+    각 테스트마다 테이블 + 캐시를 초기화하여 테스트 격리를 보장합니다.
     Spring의 @SpringBootTest + @Transactional(rollback=true) 와 유사합니다.
+
+    [캐시 격리]
+    각 테스트 전후로 fakeredis 를 초기화하여 캐시 상태가 다음 테스트에
+    영향을 주지 않도록 합니다.
+    Spring의 @DirtiesContext 또는 @CacheEvict(allEntries=true) 와 유사한 역할.
     """
     Base.metadata.create_all(bind=test_engine)
+    fake_redis.flushall()  # 테스트 시작 전 캐시 초기화
     with TestClient(app) as c:
         yield c
     Base.metadata.drop_all(bind=test_engine)
+    fake_redis.flushall()  # 테스트 종료 후 캐시 초기화

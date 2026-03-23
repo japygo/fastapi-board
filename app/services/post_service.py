@@ -15,6 +15,7 @@
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.cache import cacheable, cache_evict, make_cache_key, evict_post_cache
 from app.domain.post import Post
 from app.repositories.post_repository import PostRepository
 from app.schemas.post import PostCreateRequest, PostUpdateRequest, PostListResponse, PostResponse
@@ -41,9 +42,25 @@ class PostService:
         # 여기서는 간단하게 직접 인스턴스 생성 (DI 컨테이너 없이)
         self.post_repo = PostRepository()
 
+    # ── 게시글 목록 조회 (캐시 적용) ─────────────────────────────────────────────
+    # Spring @Cacheable 비교:
+    #   @Cacheable(value = "posts", key = "'posts:' + #skip + ':' + #limit")
+    #   @Transactional(readOnly = true)
+    #   public PostListResponse getPosts(int skip, int limit) { ... }
+    @cacheable(
+        key_func=lambda db, skip=0, limit=20, **kw: make_cache_key("posts", skip, limit),
+        ttl=60,  # 목록은 1분 캐시 (자주 변경되므로 단건보다 짧게)
+    )
     def get_posts(self, db: Session, skip: int = 0, limit: int = 20) -> PostListResponse:
         """
-        게시글 목록 조회
+        게시글 목록 조회 (캐시 적용)
+
+        [캐시 키] posts:{skip}:{limit}
+        예) posts:0:20, posts:20:20
+
+        [캐시 전략]
+        - 목록은 게시글 생성/수정/삭제 시 전체 무효화 (allEntries=true 와 유사)
+        - TTL: 60초 (목록은 단건보다 변경 빈도가 높으므로 짧게 설정)
 
         Spring 비교:
             @Transactional(readOnly = true)
@@ -60,9 +77,25 @@ class PostService:
 
         return PostListResponse(posts=post_responses, total=total)
 
+    # ── 게시글 단건 조회 (캐시 적용) ─────────────────────────────────────────────
+    # Spring @Cacheable 비교:
+    #   @Cacheable(value = "post", key = "#postId")
+    #   @Transactional(readOnly = true)
+    #   public PostResponse getPost(Long postId) { ... }
+    @cacheable(
+        key_func=lambda db, post_id, **kw: make_cache_key("post", post_id),
+        ttl=300,  # 단건은 5분 캐시
+    )
     def get_post(self, db: Session, post_id: int) -> PostResponse:
         """
-        게시글 단건 조회
+        게시글 단건 조회 (캐시 적용)
+
+        [캐시 키] post:{post_id}
+        예) post:1, post:42
+
+        [캐시 전략]
+        - 단건은 해당 게시글 수정/삭제 시에만 무효화
+        - TTL: 300초 (5분)
 
         Spring 비교:
             @Transactional(readOnly = true)
@@ -84,9 +117,19 @@ class PostService:
 
         return PostResponse.model_validate(post)
 
+    # ── 게시글 생성 (캐시 무효화) ─────────────────────────────────────────────────
+    # Spring @CacheEvict 비교:
+    #   @CacheEvict(value = "posts", allEntries = true)
+    #   @Transactional
+    #   public PostResponse createPost(PostCreateRequest request) { ... }
+    @cache_evict("posts:*")  # 목록 캐시 전체 무효화 (새 게시글이 추가되었으므로)
     def create_post(self, db: Session, request: PostCreateRequest) -> PostResponse:
         """
-        게시글 생성
+        게시글 생성 (목록 캐시 무효화)
+
+        [캐시 동작]
+        생성 성공 후 → "posts:*" 패턴의 모든 캐시 삭제
+        → 다음 목록 조회 시 DB에서 최신 데이터를 가져와 다시 캐시
 
         Spring 비교:
             @Transactional
@@ -117,17 +160,18 @@ class PostService:
         self, db: Session, post_id: int, request: PostUpdateRequest
     ) -> PostResponse:
         """
-        게시글 수정 (PATCH - 일부 필드만 수정 가능)
+        게시글 수정 (PATCH - 일부 필드만 수정 가능) + 캐시 무효화
 
-        Spring 비교:
+        [캐시 동작]
+        수정 성공 후 → 해당 게시글 단건 캐시 + 목록 캐시 모두 삭제
+
+        Spring @CacheEvict 비교:
+            @Caching(evict = {
+                @CacheEvict(value = "post", key = "#id"),
+                @CacheEvict(value = "posts", allEntries = true)
+            })
             @Transactional
-            public PostResponse updatePost(Long id, PostUpdateRequest request) {
-                Post post = postRepository.findById(id)
-                    .orElseThrow(() -> new PostNotFoundException(id));
-                if (request.title() != null) post.setTitle(request.title());
-                if (request.content() != null) post.setContent(request.content());
-                return PostResponse.from(post);
-            }
+            public PostResponse updatePost(Long id, PostUpdateRequest request) { ... }
 
         [변경 감지(Dirty Checking)]
         Spring JPA: @Transactional 안에서 엔티티 필드를 변경하면 자동으로 UPDATE
@@ -151,19 +195,26 @@ class PostService:
         db.commit()
         db.refresh(post)  # 수정된 updated_at 등 반영
 
+        # 수정된 게시글의 단건 + 목록 캐시 무효화
+        # @Caching(evict = {...}) 과 동일한 효과
+        evict_post_cache(post_id)
+
         return PostResponse.model_validate(post)
 
     def delete_post(self, db: Session, post_id: int) -> None:
         """
-        게시글 삭제
+        게시글 삭제 + 캐시 무효화
 
-        Spring 비교:
+        [캐시 동작]
+        삭제 성공 후 → 해당 게시글 단건 캐시 + 목록 캐시 모두 삭제
+
+        Spring @CacheEvict 비교:
+            @Caching(evict = {
+                @CacheEvict(value = "post", key = "#id"),
+                @CacheEvict(value = "posts", allEntries = true)
+            })
             @Transactional
-            public void deletePost(Long id) {
-                Post post = postRepository.findById(id)
-                    .orElseThrow(() -> new PostNotFoundException(id));
-                postRepository.delete(post);
-            }
+            public void deletePost(Long id) { ... }
         """
         post = self.post_repo.find_by_id(db, post_id)
         if post is None:
@@ -174,3 +225,6 @@ class PostService:
 
         self.post_repo.delete(db, post)
         db.commit()
+
+        # 삭제된 게시글의 단건 + 목록 캐시 무효화
+        evict_post_cache(post_id)
