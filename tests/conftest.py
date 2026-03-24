@@ -1,128 +1,128 @@
 # tests/conftest.py
-# Spring의 @TestConfiguration 또는 테스트용 ApplicationContext 설정 역할
-# pytest의 conftest.py는 모든 테스트 파일에서 공유되는 픽스처(fixture)를 정의합니다
+# Spring의 @TestConfiguration 역할 (비동기 버전)
 #
-# [픽스처(Fixture)란?]
-# Spring의 @BeforeEach + @AfterEach 를 합쳐놓은 개념입니다.
-# 테스트 실행 전에 필요한 객체를 준비하고, 테스트 후에 정리합니다.
+# [Before → After: 동기 → 비동기 전환]
+#
+# Before:
+#   test_engine = create_engine("sqlite:///:memory:", ...)
+#   TestSessionLocal = sessionmaker(...)
+#   def override_get_db(): yield db
+#   @pytest.fixture def db(): yield session
+#
+# After:
+#   async_test_engine = create_async_engine("sqlite+aiosqlite:///:memory:", ...)
+#   AsyncTestSessionLocal = async_sessionmaker(...)
+#   async def override_get_db(): yield db        ← async def
+#   @pytest.fixture async def db(): yield session ← async fixture
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import app
-
-# 모든 도메인 모델을 임포트하여 SQLAlchemy 레지스트리에 등록
-# Post가 relationship("Comment")를 참조하므로, Comment도 반드시 임포트 필요
-# Spring에서 @Entity 클래스들이 컨텍스트 로딩 시 자동 스캔되는 것과 유사한 역할
 from app.domain import post, comment, user  # noqa: F401
 
-# ── 공유 테스트 DB 설정 ────────────────────────────────────────────────────────
-# 모든 테스트 파일이 이 단일 엔진을 공유합니다.
-# 각 파일에 별도 엔진을 두면 app.dependency_overrides 가 충돌합니다.
-#
-# StaticPool: 여러 스레드에서 같은 인메모리 DB 연결을 공유
-# (인메모리 SQLite는 연결이 끊기면 데이터가 사라지므로 연결 유지 필요)
-TEST_DATABASE_URL = "sqlite:///:memory:"
+# ── 비동기 테스트 DB 설정 ────────────────────────────────────────────────────
+# sqlite+aiosqlite: 비동기 SQLite 드라이버 (aiosqlite 패키지 사용)
+# StaticPool: 모든 연결이 동일한 인메모리 DB를 공유
+#   → 인메모리 SQLite는 연결이 끊기면 데이터가 사라지므로 연결 유지 필요
+TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"  # sqlite:// → sqlite+aiosqlite://
 
-test_engine = create_engine(
+async_test_engine = create_async_engine(  # create_engine → create_async_engine
     TEST_DATABASE_URL,
     connect_args={"check_same_thread": False},
     poolclass=StaticPool,
     echo=False,
 )
 
-TestSessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=test_engine,
+AsyncTestSessionLocal = async_sessionmaker(  # sessionmaker → async_sessionmaker
+    async_test_engine,
+    expire_on_commit=False,
+    class_=AsyncSession,
 )
 
 
-def override_get_db():
-    """
-    테스트용 DB 세션 의존성 오버라이드 (모든 테스트 파일 공유)
-
-    FastAPI의 의존성 오버라이드:
-    Spring의 @MockBean DataSource 와 유사한 개념
-    """
-    db = TestSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# ── 비동기 의존성 오버라이드 ─────────────────────────────────────────────────
+# [Before → After]
+# Before: def override_get_db(): db = TestSessionLocal(); try: yield db; finally: db.close()
+# After:  async def override_get_db(): async with AsyncTestSessionLocal() as db: yield db
+async def override_get_db():
+    async with AsyncTestSessionLocal() as session:
+        yield session
 
 
-# 앱 레벨에서 의존성 오버라이드 등록 (한 번만 실행)
 app.dependency_overrides[get_db] = override_get_db
 
-# ── BackgroundTask 세션 오버라이드 ──────────────────────────────────────────────
-# tasks.py의 increment_view_count 는 SessionLocal() 을 직접 호출합니다.
-# 테스트 시 실제 DB가 아닌 테스트 DB를 사용하도록 오버라이드합니다.
-#
-# Spring 비교:
-# @MockBean AsyncTaskService 로 @Async 메서드를 목(Mock) 처리하거나,
-# @TestConfiguration 으로 다른 DataSource 를 주입하는 것과 동일한 역할
+# ── BackgroundTask 세션 오버라이드 ──────────────────────────────────────────
+# tasks.py의 increment_view_count 는 AsyncSessionLocal() 을 직접 호출합니다.
+# 테스트 시 테스트 DB를 사용하도록 오버라이드합니다.
 import app.tasks as tasks_module
-tasks_module.SessionLocal = TestSessionLocal  # type: ignore[assignment]
+tasks_module.AsyncSessionLocal = AsyncTestSessionLocal  # type: ignore[assignment]
 
-# ── Redis(캐시) 오버라이드 ──────────────────────────────────────────────────────
-# 테스트 시 실제 Redis 서버 없이 fakeredis(인메모리 Redis 구현체)를 사용합니다.
-# app.cache.redis_client 를 fakeredis 인스턴스로 교체합니다.
-#
-# Spring 비교:
-# @MockBean RedisTemplate 으로 Redis를 목(Mock) 처리하거나,
-# @TestConfiguration 에서 EmbeddedRedis 를 사용하는 것과 동일한 역할
+# ── Redis(캐시) 오버라이드 ──────────────────────────────────────────────────
 import fakeredis
 import app.cache as cache_module
 
-# fakeredis: 실제 Redis와 동일한 인터페이스를 메모리에서 구현
-# decode_responses=True: bytes 대신 str 반환 (실제 redis_client 설정과 동일)
 fake_redis = fakeredis.FakeRedis(decode_responses=True)
 cache_module.redis_client = fake_redis  # type: ignore[assignment]
 
 
-# ── 단위 테스트용 DB 세션 픽스처 ───────────────────────────────────────────────
-@pytest.fixture(scope="function")
-def db():
+# ── 단위 테스트용 비동기 DB 세션 픽스처 ────────────────────────────────────
+# [Before → After]
+# Before: @pytest.fixture def db(): Base.metadata.create_all(bind=test_engine); yield session
+# After:  @pytest.fixture async def db():
+#             async with async_test_engine.begin() as conn:
+#                 await conn.run_sync(Base.metadata.create_all)  ← await
+#             async with AsyncTestSessionLocal() as session:
+#                 yield session
+@pytest.fixture
+async def db():
     """
-    단위 테스트용 DB 세션 픽스처 (도메인, 레포지토리, 서비스 테스트에 사용)
+    단위 테스트용 비동기 DB 세션 픽스처
 
-    [Spring 비교]
-    @BeforeEach: Base.metadata.create_all() → 테이블 생성
-    @AfterEach:  Base.metadata.drop_all()   → 테이블 삭제 (테스트 격리)
+    [Before → After]
+    Before: create_all(bind=test_engine) → sync
+    After:  async with engine.begin() as conn: await conn.run_sync(create_all) → async
 
-    scope="function": 각 테스트 함수마다 새로운 DB 세션 생성
+    conn.run_sync(): 비동기 컨텍스트에서 동기 함수를 실행하는 방법
+    (create_all은 동기 함수이므로 run_sync 래핑 필요)
     """
-    Base.metadata.create_all(bind=test_engine)
-    session = TestSessionLocal()
-    try:
+    async with async_test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)  # ← await + run_sync
+
+    async with AsyncTestSessionLocal() as session:
         yield session
-    finally:
-        session.close()
-        Base.metadata.drop_all(bind=test_engine)
+
+    async with async_test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)  # ← await + run_sync
 
 
-# ── API 통합 테스트용 TestClient 픽스처 ───────────────────────────────────────
-@pytest.fixture(scope="function")
-def client():
+# ── API 통합 테스트용 TestClient 픽스처 ──────────────────────────────────────
+# [Before → After]
+# Before: @pytest.fixture def client(): Base.metadata.create_all(bind=test_engine); ...
+# After:  @pytest.fixture async def client():
+#             async with async_test_engine.begin() as conn:
+#                 await conn.run_sync(Base.metadata.create_all)  ← await
+@pytest.fixture
+async def client():
     """
-    API 통합 테스트용 TestClient 픽스처
+    API 통합 테스트용 TestClient 픽스처 (비동기 버전)
 
-    각 테스트마다 테이블 + 캐시를 초기화하여 테스트 격리를 보장합니다.
-    Spring의 @SpringBootTest + @Transactional(rollback=true) 와 유사합니다.
+    TestClient는 동기 HTTP 클라이언트이지만, 비동기 fixture에서 사용 가능합니다.
+    TestClient가 내부적으로 별도 스레드에 이벤트 루프를 생성하기 때문입니다.
 
-    [캐시 격리]
-    각 테스트 전후로 fakeredis 를 초기화하여 캐시 상태가 다음 테스트에
-    영향을 주지 않도록 합니다.
-    Spring의 @DirtiesContext 또는 @CacheEvict(allEntries=true) 와 유사한 역할.
+    Spring 비교:
+        @SpringBootTest + TestRestTemplate (동기 방식으로 HTTP 테스트)
     """
-    Base.metadata.create_all(bind=test_engine)
-    fake_redis.flushall()  # 테스트 시작 전 캐시 초기화
+    async with async_test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    fake_redis.flushall()
+
     with TestClient(app) as c:
         yield c
-    Base.metadata.drop_all(bind=test_engine)
-    fake_redis.flushall()  # 테스트 종료 후 캐시 초기화
+
+    async with async_test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    fake_redis.flushall()

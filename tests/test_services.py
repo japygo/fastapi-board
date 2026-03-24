@@ -1,6 +1,10 @@
 # tests/test_services.py
-# 서비스 레이어 테스트
-# Spring 비교: @SpringBootTest (슬라이스 없이 서비스 레이어 직접 테스트)
+# 서비스 레이어 테스트 (비동기 버전)
+# Spring 비교: @SpringBootTest (서비스 레이어 직접 테스트)
+#
+# [Before → After]
+# Before: def test_*(self, db): result = post_service.create_post(db, ...)
+# After:  async def test_*(self, db): result = await post_service.create_post(db, ...)
 
 import pytest
 from fastapi import HTTPException
@@ -10,151 +14,131 @@ from app.services.comment_service import CommentService
 from app.schemas.post import PostCreateRequest, PostUpdateRequest
 from app.schemas.comment import CommentCreateRequest, CommentUpdateRequest
 
-# 서비스 인스턴스 (테스트 전체에서 공유)
 post_service = PostService()
 comment_service = CommentService()
 
 
 class TestPostService:
-    """게시글 서비스 테스트"""
+    """게시글 서비스 테스트 (비동기)"""
 
-    def _create_post(self, db, title="테스트", content="내용", author="작성자"):
-        """테스트용 게시글 생성 헬퍼"""
-        return post_service.create_post(
-            db,
-            PostCreateRequest(title=title, content=content, author=author),
+    async def _create_post(self, db, title="테스트", content="내용", author="작성자"):
+        """테스트용 게시글 생성 헬퍼 (def → async def)"""
+        return await post_service.create_post(  # ← await
+            db, PostCreateRequest(title=title, content=content, author=author),
         )
 
-    def test_게시글_생성(self, db):
-        """게시글 생성 후 응답 DTO 반환 확인"""
-        response = self._create_post(db, title="새 게시글", author="홍길동")
+    async def test_게시글_생성(self, db):  # def → async def
+        response = await self._create_post(db, title="새 게시글", author="홍길동")  # ← await
 
         assert response.id is not None
         assert response.title == "새 게시글"
         assert response.author == "홍길동"
 
-    def test_게시글_목록_조회(self, db):
-        """게시글 목록 조회 (total 포함)"""
-        self._create_post(db, title="게시글 1")
-        self._create_post(db, title="게시글 2")
+    async def test_게시글_목록_조회(self, db):  # def → async def
+        await self._create_post(db, title="게시글 1")  # ← await
+        await self._create_post(db, title="게시글 2")  # ← await
 
-        result = post_service.get_posts(db)
+        result = await post_service.get_posts(db)  # ← await
 
         assert result.total == 2
         assert len(result.posts) == 2
 
-    def test_게시글_단건_조회(self, db):
-        """ID로 게시글 조회"""
-        created = self._create_post(db)
-        found = post_service.get_post(db, created.id)
+    async def test_게시글_단건_조회(self, db):  # def → async def
+        created = await self._create_post(db)  # ← await
+        found = await post_service.get_post(db, created.id)  # ← await
 
         assert found.id == created.id
         assert found.title == created.title
 
-    def test_존재하지_않는_게시글_조회_시_404(self, db):
-        """없는 게시글 조회 시 HTTPException 404 발생"""
-        # Spring 비교: assertThrows(PostNotFoundException.class, () -> ...)
+    async def test_존재하지_않는_게시글_조회_시_404(self, db):  # def → async def
         with pytest.raises(HTTPException) as exc_info:
-            post_service.get_post(db, post_id=9999)
+            await post_service.get_post(db, post_id=9999)  # ← await
 
         assert exc_info.value.status_code == 404
 
-    def test_게시글_제목_수정(self, db):
-        """제목만 수정 (PATCH 방식)"""
-        created = self._create_post(db, title="원래 제목", content="원래 내용")
+    async def test_게시글_제목_수정(self, db):  # def → async def
+        created = await self._create_post(db, title="원래 제목", content="원래 내용")  # ← await
 
-        updated = post_service.update_post(
-            db, created.id,
-            PostUpdateRequest(title="수정된 제목"),  # content는 None → 변경 안 함
+        updated = await post_service.update_post(  # ← await
+            db, created.id, PostUpdateRequest(title="수정된 제목"),
         )
 
         assert updated.title == "수정된 제목"
-        assert updated.content == "원래 내용"  # 변경되지 않아야 함
+        assert updated.content == "원래 내용"
 
-    def test_존재하지_않는_게시글_수정_시_404(self, db):
-        """없는 게시글 수정 시 404"""
+    async def test_존재하지_않는_게시글_수정_시_404(self, db):  # def → async def
         with pytest.raises(HTTPException) as exc_info:
-            post_service.update_post(db, 9999, PostUpdateRequest(title="수정"))
+            await post_service.update_post(db, 9999, PostUpdateRequest(title="수정"))  # ← await
 
         assert exc_info.value.status_code == 404
 
-    def test_게시글_삭제(self, db):
-        """게시글 삭제 후 조회 시 404"""
-        created = self._create_post(db)
+    async def test_게시글_삭제(self, db):  # def → async def
+        created = await self._create_post(db)  # ← await
+        await post_service.delete_post(db, created.id)  # ← await
 
-        post_service.delete_post(db, created.id)
-
-        # 삭제 후 조회 시 404 예외
         with pytest.raises(HTTPException) as exc_info:
-            post_service.get_post(db, created.id)
+            await post_service.get_post(db, created.id)  # ← await
         assert exc_info.value.status_code == 404
 
-    def test_존재하지_않는_게시글_삭제_시_404(self, db):
-        """없는 게시글 삭제 시 404"""
+    async def test_존재하지_않는_게시글_삭제_시_404(self, db):  # def → async def
         with pytest.raises(HTTPException) as exc_info:
-            post_service.delete_post(db, 9999)
+            await post_service.delete_post(db, 9999)  # ← await
 
         assert exc_info.value.status_code == 404
 
 
 class TestCommentService:
-    """댓글 서비스 테스트"""
+    """댓글 서비스 테스트 (비동기)"""
 
-    def _create_post(self, db):
-        """테스트용 게시글 생성"""
-        return post_service.create_post(
+    async def _create_post(self, db):
+        """테스트용 게시글 생성 (def → async def)"""
+        return await post_service.create_post(  # ← await
             db, PostCreateRequest(title="게시글", content="내용", author="작성자")
         )
 
-    def _create_comment(self, db, post_id, content="댓글", author="댓글러"):
-        """테스트용 댓글 생성"""
-        return comment_service.create_comment(
+    async def _create_comment(self, db, post_id, content="댓글", author="댓글러"):
+        """테스트용 댓글 생성 (def → async def)"""
+        return await comment_service.create_comment(  # ← await
             db, post_id, CommentCreateRequest(content=content, author=author)
         )
 
-    def test_댓글_생성(self, db):
-        """댓글 생성 후 게시글 ID 포함 확인"""
-        post = self._create_post(db)
-        comment = self._create_comment(db, post.id)
+    async def test_댓글_생성(self, db):  # def → async def
+        post = await self._create_post(db)  # ← await
+        comment = await self._create_comment(db, post.id)  # ← await
 
         assert comment.id is not None
         assert comment.post_id == post.id
 
-    def test_존재하지_않는_게시글에_댓글_생성_시_404(self, db):
-        """없는 게시글에 댓글 생성 시 404"""
+    async def test_존재하지_않는_게시글에_댓글_생성_시_404(self, db):  # def → async def
         with pytest.raises(HTTPException) as exc_info:
-            self._create_comment(db, post_id=9999)
+            await self._create_comment(db, post_id=9999)  # ← await
 
         assert exc_info.value.status_code == 404
 
-    def test_댓글_목록_조회(self, db):
-        """게시글의 댓글 목록 조회"""
-        post = self._create_post(db)
-        self._create_comment(db, post.id, content="댓글 1")
-        self._create_comment(db, post.id, content="댓글 2")
+    async def test_댓글_목록_조회(self, db):  # def → async def
+        post = await self._create_post(db)  # ← await
+        await self._create_comment(db, post.id, content="댓글 1")  # ← await
+        await self._create_comment(db, post.id, content="댓글 2")  # ← await
 
-        comments = comment_service.get_comments(db, post.id)
+        comments = await comment_service.get_comments(db, post.id)  # ← await
 
         assert len(comments) == 2
 
-    def test_댓글_수정(self, db):
-        """댓글 내용 수정"""
-        post = self._create_post(db)
-        comment = self._create_comment(db, post.id, content="원래 댓글")
+    async def test_댓글_수정(self, db):  # def → async def
+        post = await self._create_post(db)  # ← await
+        comment = await self._create_comment(db, post.id, content="원래 댓글")  # ← await
 
-        updated = comment_service.update_comment(
-            db, post.id, comment.id,
-            CommentUpdateRequest(content="수정된 댓글"),
+        updated = await comment_service.update_comment(  # ← await
+            db, post.id, comment.id, CommentUpdateRequest(content="수정된 댓글"),
         )
 
         assert updated.content == "수정된 댓글"
 
-    def test_댓글_삭제(self, db):
-        """댓글 삭제 후 목록에서 제거 확인"""
-        post = self._create_post(db)
-        comment = self._create_comment(db, post.id)
+    async def test_댓글_삭제(self, db):  # def → async def
+        post = await self._create_post(db)  # ← await
+        comment = await self._create_comment(db, post.id)  # ← await
 
-        comment_service.delete_comment(db, post.id, comment.id)
+        await comment_service.delete_comment(db, post.id, comment.id)  # ← await
 
-        remaining = comment_service.get_comments(db, post.id)
+        remaining = await comment_service.get_comments(db, post.id)  # ← await
         assert len(remaining) == 0

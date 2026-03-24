@@ -68,15 +68,15 @@ class TestPostUpdateRequest:
 class TestPostResponse:
     """응답 DTO 변환 테스트 (ORM 모델 → DTO)"""
 
-    def test_orm_객체에서_변환(self, db):
+    async def test_orm_객체에서_변환(self, db):  # def → async def
         """SQLAlchemy 모델 객체를 응답 DTO로 변환"""
         from app.domain.post import Post
 
         # given: DB에 게시글 저장
         post = Post(title="제목", content="내용", author="작성자")
         db.add(post)
-        db.commit()
-        db.refresh(post)
+        await db.commit()      # ← await
+        await db.refresh(post) # ← await
 
         # when: ORM 모델 → Pydantic DTO 변환
         # Spring의 ModelMapper.map(post, PostResponse.class) 와 동일
