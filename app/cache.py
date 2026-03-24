@@ -18,6 +18,8 @@
 # Python에서는 Redis 클라이언트를 직접 사용하고,
 # @Cacheable 패턴을 데코레이터로 직접 구현합니다.
 
+import asyncio
+import inspect
 import json
 import logging
 from functools import wraps
@@ -93,29 +95,58 @@ def cacheable(key_func: Callable, ttl: int = 300) -> Callable:
         ttl: 캐시 유효시간 (초). Spring의 entryTtl(Duration.ofSeconds(ttl)) 역할
     """
     def decorator(func: Callable) -> Callable:
-        @wraps(func)  # 원본 함수의 이름/docstring 유지
+        # ── async 함수용 래퍼 ──────────────────────────────────────────────────
+        # inspect.iscoroutinefunction(): 대상 함수가 async def 인지 확인
+        # Spring에는 없는 개념이지만, Python에서 동기/비동기 데코레이터 통합 처리 시 필요
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                func_args = args[1:] if args else args
+                cache_key = key_func(*func_args, **kwargs)
+                client = get_redis()
+                try:
+                    cached = client.get(cache_key)
+                    if cached is not None:
+                        logger.debug("[캐시 HIT] key=%s", cache_key)
+                        return json.loads(cached)
+
+                    logger.debug("[캐시 MISS] key=%s → DB 조회", cache_key)
+                    result = await func(*args, **kwargs)  # ← await 추가
+
+                    if hasattr(result, "model_dump"):
+                        serializable = result.model_dump(mode="json")
+                    elif isinstance(result, list):
+                        serializable = [
+                            item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+                            for item in result
+                        ]
+                    else:
+                        serializable = result
+
+                    client.setex(cache_key, ttl, json.dumps(serializable, ensure_ascii=False))
+                    logger.debug("[캐시 저장] key=%s (TTL=%ds)", cache_key, ttl)
+                    return result
+                except redis.RedisError as e:
+                    logger.warning("[캐시 오류] Redis 연결 실패, DB에서 직접 조회: %s", e)
+                    return await func(*args, **kwargs)
+            return async_wrapper
+
+        # ── 동기 함수용 래퍼 (하위 호환) ──────────────────────────────────────
+        @wraps(func)
         def wrapper(*args, **kwargs):
-            # self 제거 후 나머지 인자로 캐시 키 생성
-            # (첫 번째 인자가 self인 메서드 대응)
             func_args = args[1:] if args else args
             cache_key = key_func(*func_args, **kwargs)
             client = get_redis()
 
             try:
-                # ① 캐시 조회 (Spring의 @Cacheable 1단계: 캐시 히트 확인)
                 cached = client.get(cache_key)
                 if cached is not None:
                     logger.debug("[캐시 HIT] key=%s", cache_key)
-                    # JSON 문자열 → Python 객체로 역직렬화
-                    # Spring의 GenericJackson2JsonRedisSerializer 역직렬화와 동일
                     return json.loads(cached)
 
-                # ② 캐시 미스 → 실제 메서드 실행 (Spring의 @Cacheable 2단계)
                 logger.debug("[캐시 MISS] key=%s → DB 조회", cache_key)
                 result = func(*args, **kwargs)
 
-                # ③ 결과 캐시 저장 (Spring의 @Cacheable 3단계: 결과 저장)
-                # Pydantic 모델은 .model_dump() 로 dict 변환 후 JSON 직렬화
                 if hasattr(result, "model_dump"):
                     serializable = result.model_dump(mode="json")
                 elif isinstance(result, list):
@@ -128,12 +159,9 @@ def cacheable(key_func: Callable, ttl: int = 300) -> Callable:
 
                 client.setex(cache_key, ttl, json.dumps(serializable, ensure_ascii=False))
                 logger.debug("[캐시 저장] key=%s (TTL=%ds)", cache_key, ttl)
-
                 return result
 
             except redis.RedisError as e:
-                # Redis 장애 시 캐시를 건너뛰고 DB에서 직접 조회
-                # Spring의 @Cacheable 에서 Redis 장애 시 메서드가 정상 실행되는 것과 동일
                 logger.warning("[캐시 오류] Redis 연결 실패, DB에서 직접 조회: %s", e)
                 return func(*args, **kwargs)
 
@@ -162,26 +190,29 @@ def cache_evict(*key_patterns: str) -> Callable:
         key_patterns: 삭제할 캐시 키 패턴 (와일드카드 * 지원)
     """
     def decorator(func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            # 먼저 메서드 실행
-            # Spring의 @CacheEvict(beforeInvocation=false, 기본값) 와 동일
-            result = func(*args, **kwargs)
-
-            # 메서드 성공 후 캐시 삭제
+        def _do_evict():
             client = get_redis()
             try:
                 for pattern in key_patterns:
-                    # 와일드카드 패턴으로 키 검색 후 삭제
-                    # Spring의 allEntries=true 와 유사
                     keys = client.keys(pattern)
                     if keys:
                         client.delete(*keys)
                         logger.debug("[캐시 삭제] pattern=%s, %d개 삭제", pattern, len(keys))
             except redis.RedisError as e:
-                # 캐시 삭제 실패는 비즈니스 로직에 영향 없음
                 logger.warning("[캐시 삭제 오류] %s", e)
 
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                result = await func(*args, **kwargs)
+                _do_evict()
+                return result
+            return async_wrapper
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            result = func(*args, **kwargs)
+            _do_evict()
             return result
         return wrapper
     return decorator

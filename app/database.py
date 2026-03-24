@@ -1,94 +1,123 @@
 # app/database.py
 # Spring의 DataSource + JPA EntityManagerFactory 설정 역할
-# SQLAlchemy 엔진과 세션을 설정합니다
+# SQLAlchemy 비동기(Async) 엔진과 세션을 설정합니다
+#
+# [Before → After: 동기 → 비동기 전환]
+#
+# Before (동기):
+#   engine = create_engine(DATABASE_URL)
+#   SessionLocal = sessionmaker(bind=engine)
+#   def get_db():
+#       db = SessionLocal()
+#       try: yield db
+#       finally: db.close()
+#
+# After (비동기):
+#   async_engine = create_async_engine(DATABASE_URL)        ← create_async_engine
+#   AsyncSessionLocal = async_sessionmaker(async_engine)    ← async_sessionmaker
+#   async def get_db():                                     ← async def
+#       async with AsyncSessionLocal() as db:               ← async with
+#           yield db
+#
+# Spring WebFlux(Reactive) 비교:
+#   R2DBC + ReactiveEntityManager 구성과 동일한 목적
+#   FastAPI는 코루틴 기반이라 WebFlux보다 코드가 훨씬 간결합니다
 
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase
 
 from app.config import settings
 
 
-# ── 엔진 생성 ──────────────────────────────────────────────────────────────────
-# Spring의 DataSource 빈(Bean) 역할
-# 데이터베이스와의 실제 연결을 관리하는 객체입니다
+# ── 비동기 URL 변환 ────────────────────────────────────────────────────────────
+def _make_async_url(url: str) -> str:
+    """
+    동기 DB URL을 비동기 드라이버 URL로 변환합니다.
 
-# SQLite 사용 시 connect_args 설정 필요
-# check_same_thread=False: SQLite는 기본적으로 한 스레드에서만 사용 가능한데,
-# FastAPI는 여러 스레드를 사용하므로 이 제한을 해제합니다
-# (PostgreSQL이나 MySQL은 이 설정이 필요 없습니다)
-connect_args = {}
-if settings.database_url.startswith("sqlite"):
-    connect_args["check_same_thread"] = False
+    예) sqlite:///./board.db    → sqlite+aiosqlite:///./board.db
+        postgresql://user@host → postgresql+asyncpg://user@host
 
-engine = create_engine(
-    settings.database_url,
-    connect_args=connect_args,
-    # echo=True: 실행되는 SQL을 콘솔에 출력 (Spring의 show-sql: true 와 동일)
-    echo=settings.debug,
+    [드라이버 설치]
+    SQLite  비동기: uv add aiosqlite   (개발/테스트용)
+    PG      비동기: uv add asyncpg     (운영 환경)
+    """
+    if url.startswith("sqlite:///"):
+        return url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
+
+# ── 비동기 엔진 (앱 실행용) ────────────────────────────────────────────────────
+# Spring의 R2DBC ConnectionFactory 역할
+# 비동기 I/O로 DB와 통신 → 요청 처리 중 DB 대기 시간에 다른 요청을 처리 가능
+async_engine = create_async_engine(
+    _make_async_url(settings.database_url),
+    echo=settings.debug,  # SQL 쿼리 로그 (Spring의 show-sql: true)
 )
 
-
-# SQLite 전용: 외래 키 제약 조건 활성화
-# SQLite는 기본적으로 외래 키를 검사하지 않습니다
-# (PostgreSQL, MySQL은 이 설정이 필요 없습니다)
-@event.listens_for(engine, "connect")
-def set_sqlite_pragma(dbapi_conn, connection_record):
-    if settings.database_url.startswith("sqlite"):
-        cursor = dbapi_conn.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-
-# ── 세션 팩토리 ────────────────────────────────────────────────────────────────
-# Spring의 EntityManager + @Transactional 역할
-# 데이터베이스 작업의 단위(트랜잭션)를 관리합니다
-
-SessionLocal = sessionmaker(
-    # 트랜잭션 자동 커밋 비활성화 (명시적으로 commit() 호출 필요)
-    # Spring의 @Transactional 에서 메서드 종료 시 자동 커밋하는 것과 달리,
-    # Python에서는 명시적으로 관리합니다
-    autocommit=False,
-    # 변경사항 자동 flush 비활성화 (명시적으로 flush() 호출 필요)
-    autoflush=False,
-    bind=engine,
+# ── 비동기 세션 팩토리 ──────────────────────────────────────────────────────────
+# Spring의 EntityManagerFactory(비동기) 역할
+#
+# expire_on_commit=False: commit() 후 객체 속성이 만료되지 않도록 설정
+#   → 비동기에서는 commit 후 lazy load가 불가능하므로 필수!
+#   → 없으면 commit() 후 obj.field 접근 시 "MissingGreenlet" 오류 발생
+#   → Spring에서 OSIV(Open Session In View)를 끄고 DTO로 변환하는 것과 유사
+AsyncSessionLocal = async_sessionmaker(
+    async_engine,
+    expire_on_commit=False,
+    class_=AsyncSession,
 )
+
+# ── 동기 엔진 (Alembic 마이그레이션 전용) ─────────────────────────────────────
+# Alembic은 동기 방식으로 마이그레이션을 실행합니다.
+# 앱 코드(라우터/서비스/레포지토리)에서는 절대 사용하지 않습니다.
+_connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+engine = create_engine(settings.database_url, connect_args=_connect_args, echo=settings.debug)
 
 
 # ── Base 클래스 ────────────────────────────────────────────────────────────────
-# Spring의 @Entity 가 상속받는 JPA 엔티티의 기반 역할
-# 모든 도메인 모델(테이블)은 이 Base 를 상속받습니다
-
 class Base(DeclarativeBase):
-    """
-    모든 SQLAlchemy 모델의 기반 클래스
-
-    Spring에서 @Entity 어노테이션을 붙이는 것처럼,
-    Python에서는 이 Base 클래스를 상속받아 테이블을 정의합니다.
-    """
+    """모든 SQLAlchemy 모델의 기반 클래스 (Spring의 @Entity 기반 역할)"""
     pass
 
 
-# ── 의존성 주입용 세션 제공 함수 ────────────────────────────────────────────────
-# Spring의 @Autowired EntityManager 역할
-# FastAPI의 Depends() 와 함께 사용하여 각 요청마다 새로운 세션을 제공합니다
+# ── 비동기 세션 의존성 함수 ────────────────────────────────────────────────────
+# [Before → After 핵심 변경점]
+#
+# Before:  def get_db()          → sync generator
+#          db = SessionLocal()   → 동기 세션 생성
+#          try: yield db
+#          finally: db.close()
+#
+# After:   async def get_db()            → async generator
+#          async with AsyncSessionLocal() as db:  → 비동기 컨텍스트 매니저
+#              yield db
+#
+# async with: 동기의 try/finally와 동일하게 세션 close 보장
+# 차이: I/O 대기 중 이벤트 루프가 다른 코루틴을 실행할 수 있음
 
-def get_db():
+async def get_db():
     """
-    데이터베이스 세션을 생성하고, 요청 처리 후 자동으로 닫는 제너레이터 함수
-
-    FastAPI의 의존성 주입(Dependency Injection) 시스템과 연동됩니다.
-    Spring의 @Transactional 과 유사하게, 요청 시작 시 세션을 열고
-    요청 종료 시(성공/실패 모두) 세션을 닫습니다.
+    비동기 DB 세션 제공 함수 (FastAPI Depends() 와 함께 사용)
 
     사용 예시:
         @router.get("/posts")
-        def get_posts(db: Session = Depends(get_db)):
-            ...
+        async def get_posts(db: AsyncSession = Depends(get_db)):
+            result = await db.execute(select(Post))
+            posts = result.scalars().all()
 
-    yield 키워드: Python 제너레이터. try/finally 로 세션 정리를 보장합니다.
+    Spring 비교:
+        // Spring Data JPA (동기)
+        @Autowired PostRepository postRepository;
+
+        // Spring WebFlux + R2DBC (비동기)
+        @Autowired ReactivePostRepository postRepository;
     """
-    db = SessionLocal()
-    try:
-        yield db          # 이 시점에서 라우터 함수에 세션을 전달
-    finally:
-        db.close()        # 요청 완료 후 항상 세션 닫기 (finally = Spring의 @After)
+    async with AsyncSessionLocal() as db:
+        yield db
